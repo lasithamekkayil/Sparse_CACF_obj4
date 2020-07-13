@@ -1,0 +1,1129 @@
+import numpy as np
+import cv2
+import os
+from utils import linear_mapping, pre_process, random_warp
+import csv
+import tensorflow as tf
+from keras.layers import Input, Lambda, Dense, Flatten
+from keras.layers import Dropout, Conv2D, MaxPool2D, GlobalAveragePooling2D
+from keras.models import Model
+from keras.applications.vgg16 import VGG16
+from keras.applications.vgg16 import preprocess_input
+from keras.preprocessing import image
+from keras.preprocessing.image import ImageDataGenerator
+from keras.models import Sequential
+from keras import backend as K
+from glob import glob
+import matplotlib.pyplot as plt
+import scipy.sparse as sparse
+from PIL import Image
+import random
+import shutil
+import math
+from distutils.dir_util import copy_tree
+from scipy.spatial import distance
+from skimage import measure
+#from skimage import metrics.structural_similarity
+
+
+
+"""
+This module implements the Context Aware correlation filter based tracking algorithm with Deep learning-- MOSSE CACF 
+
+Date: 2020-05-22
+
+"""
+
+class mosselas5_bigandsmallpatch:
+    def __init__(self, args, img_path, dataset):
+        # get arguments..
+        self.args = args
+        self.img_path = img_path
+        self.dataset = dataset
+        #self.gt_path = gt_path
+        # get the img lists...
+        self.frame_lists = self._get_img_lists(self.img_path)
+        self.frame_lists.sort()
+    
+    # start to do the object tracking...
+    def start_tracking(self):
+        # get the image of the first frame... (read as gray scale image...)
+        init_img = cv2.imread(self.frame_lists[0])
+        init_img_training =init_img.astype(np.float32)
+        init_frame = cv2.cvtColor(init_img, cv2.COLOR_BGR2GRAY)
+        init_frame = init_frame.astype(np.float32)
+        f=open(os.path.join('datasets/'+ self.dataset, 'groundtruth_rect.txt'))
+        #Convert the text file to a list
+        gt = []
+        for line in f:
+            stripped_line = line. strip()
+            line_list = stripped_line. split(',')
+            gt. append(line_list)
+        f. close()  
+        #Convert the strings in the text file to a list
+        for j in range(len(gt)):
+            temp = gt[j]
+            for i in range(0, len(temp)): 
+                temp[i] = int(temp[i])
+            gt[j] = temp            
+        #if the target is large, lower the resolution
+        #resize_img
+        #step1 resize the width and height
+        init_gt = gt[0] 
+        width_for_accuracy_calculation = init_gt[2]
+        height_for_accuracy_calculation = init_gt[3]
+        
+        target_sz = []
+        window_sz=[]
+        init_frame_old = init_frame
+        pos, target_sz, init_frame, resize_image_done = self._resize_img(init_gt, init_frame_old)
+
+        if resize_image_done ==1:
+            init_img_training = cv2.resize(init_img_training, (0,0), fx=0.5, fy=0.5)
+            width_for_accuracy_calculation = int(np.ceil(np.divide(width_for_accuracy_calculation,2)))
+            height_for_accuracy_calculation = int(np.ceil(np.divide(height_for_accuracy_calculation,2)))
+
+        
+        #perform padding to have coarse patch (bigger window size) - which is better than searching inside a fine patch
+        #padding correlation filter
+        padding = 2
+        window_sz.append(np.floor(target_sz[0]*(1+padding)))
+        window_sz.append(np.floor(target_sz[1]*(1+padding)))
+        #Padding deep learning testing
+        padding_DL =1.25
+        window_sz_DL_testing =[]
+        window_sz_DL_testing.append(np.floor(np.add(target_sz[0],20)))
+        window_sz_DL_testing.append(np.floor(np.add(target_sz[1],20)))
+        #Padding deep learning training
+        padding_DL =0
+        window_sz_DL =[]
+        window_sz_DL.append(np.floor(target_sz[0]*(1+padding_DL)))
+        window_sz_DL.append(np.floor(target_sz[1]*(1+padding_DL)))
+        output_sigma_factor = 0.1
+        sz_for_gaussian = np.floor(window_sz)
+        out_sigma = (np.sqrt(target_sz[0]*target_sz[1]))*(output_sigma_factor)
+
+        #compute the response map
+        response_map_las = np.fft.fft2(self._gauss_label(out_sigma,window_sz))
+        cos_window = np.array(np.hanning(window_sz[1]))[np.newaxis] * ((np.array(np.hanning(window_sz[0]))[np.newaxis]).T)
+        
+        #compute the offset for the CACF context           
+        offset = np.zeros((4,2))
+        offset[0,0] = -(np.floor(init_gt[3]))
+        offset[1,1] = -(np.floor(init_gt[2]))
+        offset[2,0] = np.floor(init_gt[3])
+        offset[3,1] = np.floor(init_gt[2])
+
+        #compute the offset for the background           
+        offset_background = np.zeros((4,2))
+        offset_background[0,0] = -(np.floor(window_sz[0]))
+        offset_background[1,1] = -(np.floor(window_sz[1]))
+        offset_background[2,0] = np.floor(window_sz[0])
+        offset_background[3,1] = np.floor(window_sz[1])
+
+        #Define scale variations for target size 
+        area_target = int(np.ceil(np.multiply(target_sz[0],target_sz[1])))
+        if area_target > 3000 :
+            targert_sz_with_scale_variations = np.zeros((10,2))
+            targert_sz_with_scale_variations[0] = np.subtract(target_sz, [20,20])
+            targert_sz_with_scale_variations[1] = np.subtract(target_sz, [16,16])
+            targert_sz_with_scale_variations[2] = np.subtract(target_sz, [12,12])
+            targert_sz_with_scale_variations[3] = np.subtract(target_sz, [8,8])
+            targert_sz_with_scale_variations[4] = np.subtract(target_sz, [5,5])
+            targert_sz_with_scale_variations[5] = np.add(target_sz, [2,2])
+            targert_sz_with_scale_variations[6] = np.add(target_sz, [5,5])
+            targert_sz_with_scale_variations[7] = np.add(target_sz, [10,10])
+            targert_sz_with_scale_variations[8] = np.add(target_sz, [15,15])
+            targert_sz_with_scale_variations[9] = np.add(target_sz, [20,20])
+        else:
+            targert_sz_with_scale_variations = np.zeros((5,2))
+            targert_sz_with_scale_variations[0] = np.add(target_sz, [2,2])
+            targert_sz_with_scale_variations[1] = np.add(target_sz, [5,5])
+            targert_sz_with_scale_variations[2] = np.add(target_sz, [10,10])
+            targert_sz_with_scale_variations[3] = np.add(target_sz, [15,15])
+            targert_sz_with_scale_variations[4] = np.add(target_sz, [20,20])
+          
+        # start to draw the gaussian response...a
+        g = response_map_las
+        #lasithas patch for the first image
+        patch_info = self._get_subwindow(init_frame, pos, window_sz)
+        patch = patch_info[0]
+        original_firstframe_patch = patch
+        #previous_patch_old = patch
+        #previous_patch_resized = cv2.resize(previous_patch_old, (int(target_sz[1]),int(target_sz[0])))
+
+
+        #Create train folder
+        current_directory = os.getcwd()
+        train_directory = os.path.join(current_directory, r'train_folder')
+        os.makedirs(train_directory)
+        train_foreground = os.path.join(train_directory, r'foreground')
+        os.makedirs(train_foreground)
+        train_background = os.path.join(train_directory, r'background')
+        os.makedirs(train_background)
+        #Create test folder
+        test_directory = os.path.join(current_directory, r'test_folder')
+        os.makedirs(test_directory)
+        test_foreground = os.path.join(test_directory, r'foreground')
+        os.makedirs(test_foreground)
+        test_background = os.path.join(test_directory, r'background')
+        os.makedirs(test_background)
+        #Create evaluation folder
+        evaluation_directory = os.path.join(current_directory, r'evaluation_folder')
+        os.makedirs(evaluation_directory)
+
+        ##save the patch selected to train folder
+        ind_forground_index = 0
+        patch_info_for_DL_training = self._get_subwindow(init_img_training, pos, target_sz)
+        patch_for_DL_training = patch_info_for_DL_training[0].astype(np.uint8)
+        original_patch_for_comparison = patch_for_DL_training
+        previous_patch = patch_for_DL_training
+        size_x= int(np.floor(original_patch_for_comparison.shape[0]))
+        size_y= int(np.floor(original_patch_for_comparison.shape[1]))
+        dim_original_patch= (target_sz[0],target_sz[1])
+        cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), patch_for_DL_training)
+        ind_forground_index = ind_forground_index+1
+
+        #Generate training data by shifting 1 to 10 pixels, plus or minus from centre point
+        for right_shift in range(5,30):
+            wrap_right = cv2.copyMakeBorder(patch_for_DL_training,0,0,right_shift,0,cv2.BORDER_REPLICATE)
+            cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), wrap_right)
+            ind_forground_index = ind_forground_index+1
+        for left_shift in range(5,30):
+            wrap_left = cv2.copyMakeBorder(patch_for_DL_training,0,0,0,left_shift,cv2.BORDER_REPLICATE)
+            cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), wrap_left)
+            ind_forground_index = ind_forground_index+1
+
+        #changing the dimension of patch_for_DL_training - This is performed to use the patch for data augmentation 
+        patch_for_DL_training_dim_change = np.array(patch_for_DL_training)
+        patch_for_DL_training_dim_change = np.expand_dims(patch_for_DL_training_dim_change, axis =0)
+        ##Use imagedatagenerator and generate multiple train images from first single image patch
+        datagen = ImageDataGenerator(rotation_range=180, horizontal_flip=True, width_shift_range=0.2, zoom_range = 0.15, height_shift_range = 0.2,shear_range =0.15, fill_mode = "nearest")
+        datagen.fit(patch_for_DL_training_dim_change)
+        #save the generated training images
+        index_img=0
+        batch_size=20
+        for img_batch in datagen.flow(patch_for_DL_training_dim_change, batch_size=20):
+            for img in img_batch:
+                cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), img)
+                ind_forground_index = ind_forground_index+1
+                index_img = index_img+1   
+            if index_img >= batch_size:
+                break
+        
+
+        ##save the patch selected to train foreground folder - object with background
+        patch_info_for_DL_test_forgnd = self._get_subwindow(init_img_training, pos, window_sz_DL_testing)
+        patch_for_DL_test_forgnd = patch_info_for_DL_test_forgnd[0].astype(np.uint8)
+        cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), patch_for_DL_test_forgnd)
+        ind_forground_index = ind_forground_index+1
+
+        #Generate training data by shifting 1 to 10 pixels, plus or minus from centre point
+        for right_shift in range(5,20):
+            wrap_right = cv2.copyMakeBorder(patch_for_DL_test_forgnd,0,0,right_shift,0,cv2.BORDER_REPLICATE)
+            cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), wrap_right)
+            ind_forground_index = ind_forground_index+1
+        for left_shift in range(5,20):
+            wrap_left = cv2.copyMakeBorder(patch_for_DL_test_forgnd,0,0,0,left_shift,cv2.BORDER_REPLICATE)
+            cv2.imwrite(os.path.join(train_foreground , str(ind_forground_index) +'.jpg'), wrap_left)
+            ind_forground_index = ind_forground_index+1
+
+        #Generate background data and save in train_folder
+        #compute immediate background with offset for the test data
+        ind_background_index =0          
+        for val in range(len(offset)):
+            patch_info_for_DL_background = self._get_subwindow(init_img_training, np.add(pos,offset[val]), target_sz)
+            if patch_info_for_DL_background[1] ==0:
+                continue
+            patch_for_DL_background =patch_info_for_DL_background[0].astype(np.uint8)
+            cv2.imwrite(os.path.join(train_background , str(ind_background_index) +'.jpg'), patch_for_DL_background)
+            ind_background_index = ind_background_index +1
+            ##Use imagedatagenerator and generate multiple images from background image patches for train folder/background
+            patch_for_DL_background_dim_change = np.array(patch_for_DL_background)
+            patch_for_DL_background_dim_change = np.expand_dims(patch_for_DL_background_dim_change, axis =0)
+            datagen = ImageDataGenerator(horizontal_flip=0.3, width_shift_range=[-3,3])
+            datagen.fit(patch_for_DL_background_dim_change)
+            #save the generated training images
+            index_img_train_background=0
+            batch_size=25
+            for img_batch1 in datagen.flow(patch_for_DL_background_dim_change, batch_size=25):
+                for img in img_batch1:
+                    cv2.imwrite(os.path.join(train_background , str(ind_background_index) +'.jpg'), img)
+                    ind_background_index = ind_background_index +1
+                    index_img_train_background = index_img_train_background+1   
+                if index_img_train_background >= batch_size:
+                    break
+                   
+        for val in range(len(offset_background)):        
+            patch_info_for_DL_background_bigwindow = self._get_subwindow(init_img_training, np.add(pos,offset[val]), target_sz)
+            if patch_info_for_DL_background_bigwindow[1] ==0:
+                continue
+            patch_for_DL_background_bigwindow =patch_info_for_DL_background_bigwindow[0].astype(np.uint8)
+            cv2.imwrite(os.path.join(train_background , str(ind_background_index) +'.jpg'), patch_for_DL_background_bigwindow)
+            ind_background_index = ind_background_index+1
+            patch_for_DL_background_bigwindow = np.array(patch_for_DL_background_bigwindow)
+            patch_for_DL_background_bigwindow = np.expand_dims(patch_for_DL_background_bigwindow, axis =0)
+            datagen = ImageDataGenerator(rotation_range=3, horizontal_flip=0.3, width_shift_range=[-6,6])
+            datagen.fit(patch_for_DL_background_bigwindow)
+            index_img_train_background_b=0
+            batch_size=20
+            for img_batch1 in datagen.flow(patch_for_DL_background_bigwindow, batch_size=20):
+                for img in img_batch1:
+                    cv2.imwrite(os.path.join(train_background , str(ind_background_index) +'.jpg'), img)
+                    ind_background_index = ind_background_index+1
+                    index_img_train_background_b = index_img_train_background_b+1   
+                if index_img_train_background_b >= batch_size:
+                    break
+        
+        #move 20 percent of images from train data to test data foreground
+        onlyfiles = [f for f in os.listdir(train_foreground)]
+        random.shuffle(onlyfiles)
+        number_of_files = int(np.ceil(np.multiply(len(onlyfiles),.2)))
+        small_list = onlyfiles[:number_of_files]
+
+        # copy the selected files to test folder foreground
+        for x in small_list:
+            shutil.copy('F:/current_code_15_06_202/train_folder/foreground/'+str(x),'F:/current_code_15_06_202/test_folder/foreground/')
+
+        #move 20 percent of images from train data to test data background
+        onlyfiles_background = [f for f in os.listdir(train_background)]
+        random.shuffle(onlyfiles_background)
+        number_of_files_background = int(np.ceil(np.multiply(len(onlyfiles_background),.2)))
+        small_list_background = onlyfiles_background[:number_of_files_background]
+
+        # copy the selected files to test folder background
+        for x in small_list_background:
+            shutil.copy('F:/current_code_15_06_202/train_folder/background/'+str(x),'F:/current_code_15_06_202/test_folder/background/')
+            
+
+        #Train the deep learning network
+        # re-size all the images to this
+        #for vgg16
+        IMAGE_SIZE = [224, 224]
+        #for resnet50
+        window_sz[1] = int(np.floor(window_sz[1]))
+        window_sz[0] = int(np.floor(window_sz[0]))
+
+        #IMAGE_SIZE = [window_sz[1], window_sz[0]]
+        print(type(window_sz[1]))
+
+        train_path = 'train_folder'
+        valid_path = 'test_folder'
+
+        # add preprocessing layer to the front of VGG
+        vgg = VGG16(input_shape=IMAGE_SIZE + [3], weights='imagenet', include_top=False)
+        # don't train existing weights
+        for layer in vgg.layers:
+            layer.trainable = False
+        # useful for getting number of classes
+        folders = glob('train_folder/*')
+        # our layers - you can add more if you want
+        
+        #x=vgg.output
+        #x= GlobalAveragePooling2D()(x)
+        #x = Dense(1000, activation='relu')(x)
+        #x = Dropout(0.5)(x)
+
+        #Always flatten it befor passing to dense layer
+        x = Flatten()(vgg.output)
+        #x = Dense(256, activation='relu')(x)
+        #x = Dropout(0.5)(x)
+        prediction = Dense(len(folders), activation='softmax')(x)
+        # create a model object
+        model = Model(inputs=vgg.input, outputs=prediction)
+
+        # view the structure of the model
+        model.summary()
+        # tell the model what cost and optimization method to use
+        #lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=0.01, decay_steps=10000, decay_rate =0.9)
+        #opt = tf.keras.optimizers.Adam(lr_schedule)
+        #model.compile(loss='categorical_crossentropy',optimizer=opt,metrics=['accuracy'])
+        model.compile(loss='categorical_crossentropy',optimizer='adam',metrics=['accuracy'])
+        train_datagen = ImageDataGenerator(rescale = 1./255,shear_range = 0.2,zoom_range = 0.2,horizontal_flip = True)
+        test_datagen = ImageDataGenerator(rescale = 1./255)
+        training_set = train_datagen.flow_from_directory('train_folder',target_size = (224,224),batch_size =64,class_mode = 'categorical')
+        test_set = test_datagen.flow_from_directory('test_folder',target_size = (224,224),batch_size =64,class_mode = 'categorical')
+        # fit the model
+        r = model.fit_generator(training_set,validation_data=test_set,epochs=10,steps_per_epoch=len(training_set),validation_steps=len(test_set))
+
+        #loss
+        plt.plot(r.history['loss'], label='train loss')
+        plt.plot(r.history['val_loss'], label='val loss')
+        plt.legend()
+        plt.show()
+        plt.savefig('LossVal_loss')
+
+        # accuracies
+        plt.plot(r.history['accuracy'], label='train acc')
+        plt.plot(r.history['val_accuracy'], label='val acc')
+        plt.legend()
+        plt.show()
+        plt.savefig('AccVal_acc')
+
+        ####Deep learning stage 1 ends here##########
+
+        #lasithas feature for the first image
+        xf = np.fft.fft2(self._get_features(patch,cos_window))
+        kf = np.multiply(np.conj(xf),xf)    
+        kfn = self._get_feature_for_all_offset(init_frame, pos, offset, window_sz,cos_window, xf, width_for_accuracy_calculation, height_for_accuracy_calculation)                   
+        num = np.multiply(np.conj(xf),response_map_las)
+        lambda1 = .01 
+        lambda2 =20
+        den = kf + lambda1 + np.multiply(lambda2,np.sum(kfn,axis=2))
+        wf = np.divide(num,den)
+        positions = []
+        positions.append(pos) 
+        final_locations =[] 
+        
+        # start the tracking..
+        for idx in range(len(self.frame_lists)):
+            if idx == 0:
+                model_wf =wf
+                #final_locations= np.floor(init_gt)
+                if resize_image_done ==1:
+                    final_locations = [init_gt[0],init_gt[1], width_for_accuracy_calculation*2, height_for_accuracy_calculation*2 ]
+                    file_output = open("results_CACF_resnet/"+ self.dataset+"_CACF_DL.txt", "a")
+                    file_output.write(str(init_gt[0]) + "," + str(init_gt[1])+"," + str(init_gt[2])+"," + str(init_gt[3]))
+                    file_output.close()
+                else:
+                    final_locations= np.floor(init_gt)
+                    file_output = open("results_CACF_resnet/"+ self.dataset+"_CACF_DL.txt", "a")
+                    file_output.write(str(init_gt[0]) + "," + str(init_gt[1])+"," + str(init_gt[2])+"," + str(init_gt[3]))
+                    file_output.close()
+            else:
+                print(idx)
+                previous_position = []
+                previous_position.append(pos[0])
+                previous_position.append(pos[1])
+                current_frame = cv2.imread(self.frame_lists[idx])
+                display_frame = current_frame
+                frame_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+                frame_gray = frame_gray.astype(np.float32)
+                height_current_frame = current_frame.shape[1]
+                width_current_frame = current_frame.shape[0]
+                resize_required_for_current_frame = (int(np.divide(height_current_frame,2)), int(np.divide(width_current_frame,2)))
+                if resize_image_done == 1:
+                    current_frame = cv2.resize(current_frame, resize_required_for_current_frame)
+                    frame_gray = cv2.resize(frame_gray, (0,0), fx=0.5, fy=0.5)  
+                patch_info = self._get_subwindow(frame_gray, pos, window_sz)
+                patch = patch_info[0]
+                zf = np.fft.fft2(self._get_features(patch,cos_window))
+                response = np.fft.ifft2(np.multiply(model_wf,zf))
+                response_real = response.real 
+                ####target location is at the maximum response. We must take into account the fact that,
+                ##if the target doesnt move, the peak will appear at the top left corner, not at the centre. 
+                ##the response wrap around cycliclically
+
+                max_value_response = np.max(response_real)
+                max_pos_response =[]
+                max_pos_location = []
+                max_pos_location = list(np.where(response_real == max_value_response))
+                # zip the 2 arrays to get the exact coordinates
+                listOfCordinates = list(zip(max_pos_location[0], max_pos_location[1]))           
+                max_pos_response.append(listOfCordinates[0][0])
+                max_pos_response.append(listOfCordinates[0][1])               
+                if (max_pos_response[0] > (len(zf)/2)):
+                    max_pos_response[0] = max_pos_response[0] - len(zf)
+                if (max_pos_response[1] > (len(zf[0])/2)):
+                    max_pos_response[1] = max_pos_response[1] - len(zf[0])
+                vert_delta = max_pos_response[0]
+                horiz_delta = max_pos_response[1]
+                modify_pos = []
+                modify_pos.append(vert_delta)
+                modify_pos.append(horiz_delta)
+                pos = np.add(pos,modify_pos) 
+                pos[0] = np.floor(pos[0])
+                pos[1] = np.floor(pos[1]) 
+                corre_output = []
+                corre_output_for_nms = []
+                corre_output_for_nms.append(np.floor(np.subtract(pos[1],np.divide(target_sz[1],2))))
+                corre_output_for_nms.append(np.floor(np.subtract(pos[0],np.divide(target_sz[0],2))))
+                corre_output_for_nms.append(np.floor(np.add(pos[1],np.divide(target_sz[1],2))))
+                corre_output_for_nms.append(np.floor(np.add(pos[0],np.divide(target_sz[0],2))))
+                #saving correlation output as xa,ya
+                corre_output.append(np.floor(np.subtract(pos[1],np.divide(target_sz[1],2))))
+                corre_output.append(np.floor(np.subtract(pos[0],np.divide(target_sz[0],2))))
+                #Check the overlap value of computed patch with actual patch, if it is less than 80% run the deep learning loop
+                #Deep learning stage2 starts here
+                #Select and save data for evaluation for deep learning
+                #save the patch selected to train folder
+                file_to_save_location_from_DL = open("file_to_save_location_from_DL.txt", "a")
+                pos_a = int(pos[0])
+                pos_b = int(pos[1])
+                file_to_save_location_from_DL.write(str(pos_a) + " " + str(pos_b))
+                file_to_save_location_from_DL.close()
+                previous_patch_old = previous_patch
+                patch_info_from_correlation_for_evaluation = self._get_subwindow(current_frame, pos, target_sz)
+                patch_from_correlation_for_evaluation = patch_info_from_correlation_for_evaluation[0].astype(np.uint8)
+                previous_patch = patch_from_correlation_for_evaluation
+                cv2.imwrite(os.path.join(evaluation_directory , 'Context_patch0.jpg'), patch_from_correlation_for_evaluation)
+                results_prediction =[]
+                patch_from_correlation_for_evaluation1 = cv2.resize(patch_from_correlation_for_evaluation, (224,224))
+                img_array_ = np.array(patch_from_correlation_for_evaluation1)
+                img_array1 = np.expand_dims(img_array_, axis =0)
+                pred1 = model.predict(img_array1)
+                print(pred1)
+                results_prediction.append(pred1)
+
+                previous_position_starting_point_x = int(np.floor(np.subtract(previous_position[1],np.divide(target_sz[1],2))))
+                previous_position_starting_point_y = int(np.floor(np.subtract(previous_position[0],np.divide(target_sz[0],2))))
+                previous_position_frame = []
+                previous_position_frame.append(previous_position_starting_point_x)
+                previous_position_frame.append(previous_position_starting_point_y)
+
+                #check ssim values for obtained patch
+                shall_i_continue_prediction = 0
+                patch_for_ssim_correlation_output = cv2.resize(patch_from_correlation_for_evaluation, (int(target_sz[1]),int(target_sz[0])))
+                ssim_value_correlation = measure.compare_ssim(np.array(previous_patch_old), np.array(patch_for_ssim_correlation_output), multichannel=True)
+                if pred1[0][1] < 0.8 and ssim_value_correlation < 0.08:
+                    #check overlap with the previous patch, if it is greater than 60 percent, dont proceed with prediction, finalise
+                    shall_i_continue_prediction = 1
+
+                index_context=0
+                if (pred1[0][1]< 0.4) or (ssim_value_correlation < 0.20):
+                    for scale_variations_img in range (0,len(targert_sz_with_scale_variations)):
+                        target_sz_scaled =[]
+                        target_sz_scaled = targert_sz_with_scale_variations[scale_variations_img]
+                        #col_scaled_starting_location = int(np.ceil(np.subtract(target_sz_scaled[0], target_sz[0])))
+                        #row_scaled_starting_location =int(np.ceil(np.subtract(target_sz_scaled[1], target_sz[1])))
+                        patch_info_scaled = self._get_subwindow(current_frame, pos, target_sz_scaled)
+                        patch_scaled = patch_info_scaled[0].astype(np.uint8)
+                        cv2.imwrite(os.path.join(evaluation_directory , 'Context_patch_scaled'+str(index_context)+'.jpg'), patch_scaled)  
+                        patch_correlation_scaled = cv2.resize(patch_scaled, (224,224))
+                        img_array_scaled = np.array(patch_correlation_scaled)
+                        img_array1_scaled = np.expand_dims(img_array_scaled, axis =0)
+                        pred_scaled = model.predict(img_array1_scaled)
+                        print(pred_scaled)
+                        index_context = index_context +1
+                        if pred_scaled[0][1] > 0.5:
+                            patch_for_ssim_scaled = cv2.resize(patch_scaled, (int(target_sz[1]),int(target_sz[0])))
+                            ssim_value_scaled = measure.compare_ssim(np.array(original_patch_for_comparison), np.array(patch_for_ssim_scaled), multichannel=True)
+                            if ssim_value_scaled >= 0.2:
+                                shall_i_continue_prediction = 0
+                                results_prediction.append(pred_scaled)
+                                break
+                            else:
+                                shall_i_continue_prediction = 1
+
+                if shall_i_continue_prediction == 1:
+                    file_to_save_location_from_DL = open("file_to_save_location_from_DL.txt","a")
+                    #if pred1[0][1] < 0.4:
+                    #select all context patch around previous frame and save in the evaluation directory (all far patches too)
+                    images = current_frame
+                    loc1 = images.shape[0]
+                    loc2 = images.shape[1]
+                    overlap_row = int(np.ceil(np.divide(target_sz[0],3)))
+                    overlap_col = int(np.ceil(np.divide(target_sz[1],3)))
+                    context_patches_around =[]
+                    starting_point_y = int(np.subtract((np.floor(np.subtract(previous_position[0],target_sz[0]))), 100))
+                    starting_point_x = int(np.subtract((np.floor(np.subtract(previous_position[1],target_sz[1]))),100))
+                    #starting_point_y = int(np.floor(np.subtract(previous_position[0],target_sz[0])))
+                    #starting_point_x = int(np.floor(np.subtract(previous_position[1],target_sz[1])))
+                    ending_point_y = int(np.floor(np.add(previous_position[0],target_sz[0])))
+                    ending_point_x = int(np.floor(np.add(previous_position[1],target_sz[1])))
+                    if starting_point_x < 0:
+                        starting_point_x =0
+                    if ending_point_x > loc1:
+                        ending_point_x = loc1
+                    if starting_point_y < 0:
+                        starting_point_y =0
+                    if ending_point_y > loc2:
+                        ending_point_y = loc2
+                    if starting_point_x == 0 and ending_point_x == 0 :
+                        starting_point_x =0
+                        ending_point_x = target_sz[1]
+                    if starting_point_y ==0 and ending_point_y ==0:
+                        starting_point_y =0
+                        ending_point_y = target_sz[0]
+                    if starting_point_x == loc1 and ending_point_x == loc1 :
+                        starting_point_x =np.abs(loc1 - target_sz[1])
+                        ending_point_x = loc1
+                    if starting_point_y ==loc2 and ending_point_y ==loc2:
+                        starting_point_y =np.abs(loc2 - target_sz[0])
+                        ending_point_y = loc2
+                    ind_DL_context = 1 
+                    for loc_val in range(starting_point_x,ending_point_x,overlap_col):
+                        for loc_col_val in range(starting_point_y,ending_point_y,overlap_row):
+                            location_x_centrepoint = np.ceil(np.add(loc_val,np.divide(target_sz[1],2)))
+                            location_y_centrepoint = np.ceil(np.add(loc_col_val,np.divide(target_sz[0],2)))
+                            location =[location_y_centrepoint, location_x_centrepoint]
+                            Multiple_patched_info_from_context_DL = self._get_subwindow(images, location, target_sz)
+                            #plt.imshow(Multiple_patched_info_from_context_DL[0])
+                            #plt.show()
+                            Multiple_patched_from_context_DL = Multiple_patched_info_from_context_DL[0].astype(np.uint8)
+                            cv2.imwrite(os.path.join(evaluation_directory , 'Context_patch'+str(ind_DL_context) +'new'+'.jpg'), Multiple_patched_from_context_DL)
+                            ind_DL_context = ind_DL_context+1
+                            #save starting point of x and y to file (note: its not centre location)
+                            file_to_save_location_from_DL.write("\n" + str(loc_col_val) + " " + str(loc_val))
+                            Multiple_patched_from_context_DL = cv2.resize(Multiple_patched_from_context_DL, (224,224))
+                            img_array = np.array(Multiple_patched_from_context_DL)
+                            img_array = np.expand_dims(img_array, axis =0)
+                            pred = model.predict(img_array)
+                            results_prediction.append(pred)
+                    file_to_save_location_from_DL.close()
+
+                    #convert the list of list to one list
+                    flat_list = [item for sublist in results_prediction for item in sublist]
+                    #print(flat_list)  
+
+                    #select the predicted values of foreground images
+                    results_list = []
+                    for values in range(len(flat_list)):
+                        results_list.append(flat_list[values][1])
+                    #print(results_list)  
+                
+                    #find the maximum prediction value among foreground images
+                    max_prediction_value = max(results_list)
+                    print(max_prediction_value) 
+
+
+                    #find the position of maximum predicted value - image correspond to this position will be our target of interest
+                    position_max = [i for i, j in enumerate(results_list) if j == max_prediction_value]
+                    #position_max = [i for i, j in enumerate(results_list) if j > 0.1]
+                    #print(position_max_prediction_value)
+
+                    dist = []
+                    if (position_max[0] ==0) and (shall_i_continue_prediction == 0):
+                        file_results = open("file_to_save_location_from_DL.txt", "r")
+                        lines = file_results.readlines()
+                        desired_position_onlyonevalue = lines[position_max[0]]
+                        values_in_desired_position_onlyonevalue = desired_position_onlyonevalue.split(" ")
+                        pos[0] = np.floor(int(values_in_desired_position_onlyonevalue[0]))
+                        pos[1] = np.floor(int(values_in_desired_position_onlyonevalue[1]))
+                        file_results.close() 
+                    else:
+                        file_results = open("file_to_save_location_from_DL.txt", "r")
+                        lines = file_results.readlines()
+                        image_copy = current_frame
+                        desired_tuple_inside_list = []
+                        file_results.close()
+                        ssim_values = []
+                        for max_pos_locations in position_max:
+                            #Filterout using patches overlap with previous frame: If no overlap at all, it indicates it is a false positive - remove false positives
+                            max_pos_locations_index = max_pos_locations
+                            desired_position_ = lines[max_pos_locations_index]
+                            position_form_of_string_ = desired_position_.rstrip()
+                            values_in_desired_position_ = position_form_of_string_.split(" ")
+                            final_loc_col_ = int(values_in_desired_position_[0])
+                            final_loc_row_ = int(values_in_desired_position_[1])
+                            starting_location_frame = []
+                            starting_location_frame.append(np.floor(final_loc_row_)) 
+                            starting_location_frame.append(np.floor(final_loc_col_)) 
+                            centre_location_y_new_frame = int(np.floor(np.add(final_loc_col_,np.divide(target_sz[1],2))))
+                            centre_location_x_new_frame = int(np.floor(np.add(final_loc_row_,np.divide(target_sz[0],2))))
+                            patch_for_ssim = self._get_subwindow(current_frame, [centre_location_y_new_frame, centre_location_x_new_frame], target_sz)
+                            patch_for_ssim_modified = patch_for_ssim[0].astype(np.uint8)
+                            patch_for_ssim_resized = cv2.resize(patch_for_ssim_modified, (int(target_sz[1]),int(target_sz[0])))
+                            s = measure.compare_ssim(np.array(original_patch_for_comparison), np.array(patch_for_ssim_resized), multichannel=True)
+                            print(s) 
+                            ssim_values.append(s)               
+                            #check for false positives and remove
+                            checking_for_false_positive = self._remove_false_positive(previous_position_frame,starting_location_frame, target_sz)
+                            if checking_for_false_positive ==1:
+                                continue
+                            desired_position_modified = []
+                            desired_position_modified_y_start = np.floor(int(final_loc_col_))
+                            desired_position_modified_y_end = np.floor(int(np.add(final_loc_col_,target_sz[0])))
+                            desired_position_modified_x_start = np.floor(int(final_loc_row_))
+                            desired_position_modified_x_end = np.floor(int(np.add(final_loc_row_,target_sz[1])))
+                            desired_position_modified.append(desired_position_modified_x_start)
+                            desired_position_modified.append(desired_position_modified_y_start)
+                            desired_position_modified.append(desired_position_modified_x_end)
+                            desired_position_modified.append(desired_position_modified_y_end)
+                            list_to_tuple = tuple(desired_position_modified)
+                            desired_tuple_inside_list.append(list_to_tuple)
+                        max_value_in_ssim_values = [i for i, j in enumerate(ssim_values) if j == max(ssim_values)]
+                        value_selected_from_ssim_values=position_max[max_value_in_ssim_values[0]]
+                        desired_position_ssim = lines[value_selected_from_ssim_values]
+                        position_form_of_string_ssim = desired_position_ssim.rstrip()
+                        values_in_desired_position_ssim = position_form_of_string_ssim.split(" ")
+                        final_loc_col_ssim_start = int(values_in_desired_position_ssim[0])
+                        final_loc_row_ssim_start = int(values_in_desired_position_ssim[1])
+                        final_loc_col_ssim_end = np.floor(int(np.add(final_loc_col_ssim_start,target_sz[0])))
+                        final_loc_row_ssim_end = np.floor(int(np.add(final_loc_row_ssim_start,target_sz[1])))
+                        desired_position_modified = []
+                        desired_position_modified.append(final_loc_row_ssim_start)
+                        desired_position_modified.append(final_loc_col_ssim_start)
+                        desired_position_modified.append(final_loc_row_ssim_end)
+                        desired_position_modified.append(final_loc_col_ssim_end)
+                        list_to_tuple = tuple(desired_position_modified)
+                        desired_tuple_inside_list.append(list_to_tuple) 
+                        boundingBoxes = np.array(desired_tuple_inside_list)
+                        #Check whether the bounding boxes are empty, if empty add previous_position
+                        boundingBoxes_new = []
+                        if len(boundingBoxes) < 1:
+                            #check correlation output is false positive or not
+                            checking_for_false_positive_correlation = self._remove_false_positive(previous_position_frame,corre_output, target_sz)
+                            if checking_for_false_positive_correlation ==0:
+                                list_to_tuple_corre = tuple(corre_output_for_nms)
+                                desired_tuple_inside_list.append(list_to_tuple_corre)
+                            else:
+                                final_loc_col_ = int(np.floor(np.subtract(previous_position[0], np.divide(target_sz[0],2))))
+                                final_loc_row_ = int(np.floor(np.subtract(previous_position[1], np.divide(target_sz[1],2))))
+                                desired_position_modified = []
+                                desired_position_modified_y_start = np.floor(int(final_loc_col_))
+                                desired_position_modified_y_end = np.floor(int(np.add(final_loc_col_,target_sz[0])))
+                                desired_position_modified_x_start = np.floor(int(final_loc_row_))
+                                desired_position_modified_x_end = np.floor(int(np.add(final_loc_row_,target_sz[1])))
+                                desired_position_modified.append(desired_position_modified_x_start)
+                                desired_position_modified.append(desired_position_modified_y_start)
+                                desired_position_modified.append(desired_position_modified_x_end)
+                                desired_position_modified.append(desired_position_modified_y_end)
+                                list_to_tuple = tuple(desired_position_modified)
+                                desired_tuple_inside_list.append(list_to_tuple)
+                            boundingBoxes_new = np.array(desired_tuple_inside_list)
+                        else:
+                            for selected_paches in range(0, len(boundingBoxes)):
+                                new_patch_from_bbbox = []
+                                new_patch_from_bbbox.append(boundingBoxes[selected_paches][0])
+                                new_patch_from_bbbox.append(boundingBoxes[selected_paches][1])
+                                checking_for_false_positive_in_bbboxes = self._remove_false_positive(previous_position_frame,new_patch_from_bbbox, target_sz)
+                                if checking_for_false_positive_in_bbboxes ==0:
+                                    y_end_value = int(np.add(new_patch_from_bbbox[0], target_sz[0]))
+                                    x_end_value = int(np.add(new_patch_from_bbbox[1], target_sz[1]))
+                                    new_patch_from_bbbox.append(y_end_value)
+                                    new_patch_from_bbbox.append(x_end_value)
+                                    new_patch_from_bbbox_ = tuple(new_patch_from_bbbox)
+                                    boundingBoxes_new.append(new_patch_from_bbbox_)
+                        
+                        ##find ssim of each one with the original patch and select the one with maximum ssim
+                        ssim_desired = []
+                        for selected_paches in range(0, len(boundingBoxes_new)):
+                            pos[1] = np.floor(int(np.add(boundingBoxes_new[selected_paches][0],np.divide(target_sz[1],2))))
+                            pos[0] = np.floor(int(np.add(boundingBoxes_new[selected_paches][1],np.divide(target_sz[0],2))))
+                            patch_for_ssim = self._get_subwindow(current_frame, pos, target_sz)
+                            patch_for_ssim_modified = patch_for_ssim[0].astype(np.uint8)
+                            patch_for_ssim_resized = cv2.resize(patch_for_ssim_modified, (int(target_sz[1]),int(target_sz[0])))
+                            s = measure.compare_ssim(np.array(previous_patch_old), np.array(patch_for_ssim_resized), multichannel=True)
+                            #print(s)
+                            ssim_desired.append(s)
+                        max_value_in_ssim_values = [i for i, j in enumerate(ssim_desired) if j == max(ssim_desired)]
+                        max_value_in_ssim_values_location = max_value_in_ssim_values[0]
+                        pos[1] = np.floor(int(np.add(boundingBoxes_new[max_value_in_ssim_values_location][0],np.divide(target_sz[1],2))))
+                        pos[0] = np.floor(int(np.add(boundingBoxes_new[max_value_in_ssim_values_location][1],np.divide(target_sz[0],2))))
+                            
+
+                    # delete the contents of evaluation folder
+                    #shutil.rmtree('evaluation_folder')
+                    #os.makedirs(evaluation_directory)
+                    #Dont delete evaluation directory, instead delete all files inside evaluation directory
+                os.remove('file_to_save_location_from_DL.txt')
+                filelist = [ f for f in os.listdir(evaluation_directory) if f.endswith(".jpg") ]
+                for f in filelist:
+                    os.remove(os.path.join(evaluation_directory, f))
+
+                #deep learning stage 2 ends here - updated location of patch
+
+                # Filter updation wrt the identified target position starts here          
+                #Hi = Ai / Bi
+                #the pos used is my output of overall iteration
+                patch_info = self._get_subwindow(frame_gray, pos, window_sz)
+                patch=patch_info[0]
+                #plt.imshow(patch)
+                #plt.show()
+                xf = np.fft.fft2(self._get_features(patch,cos_window))
+                kf = np.multiply(np.conj(xf),xf) 
+                kfn = self._get_feature_for_all_offset(init_frame, pos, offset, window_sz,cos_window, xf, width_for_accuracy_calculation, height_for_accuracy_calculation) 
+                num = np.multiply(np.conj(xf),response_map_las)
+                lambda1 = .025
+                lambda2 =2
+                den = kf + lambda1 + np.multiply(lambda2,np.sum(kfn,axis=2))
+                wf = np.divide(num,den)
+                
+                #update the filter
+                interp_factor = 0.05
+                model_wf = np.multiply((1-interp_factor),model_wf) + np.multiply(interp_factor,wf)
+                positions = np.vstack((positions,pos))
+                pos_display = []
+                if resize_image_done == 1:
+                    #modified_width = int(np.ceil(np.divide(width_for_accuracy_calculation,2)))
+                    #modified_height = int(np.ceil(np.divide(height_for_accuracy_calculation,2)))
+                    pos_computation_for_display0_DL = np.floor(np.subtract(pos[1],np.divide(width_for_accuracy_calculation,2)))
+                    pos_computation_for_display1_DL = np.floor(np.subtract(pos[0],np.divide(height_for_accuracy_calculation,2)))
+                    if pos_computation_for_display0_DL < 0:
+                        pos_computation_for_display0_DL =0
+                    if pos_computation_for_display1_DL < 0:
+                        pos_computation_for_display1_DL =0
+                    pos_display.append(pos_computation_for_display0_DL)
+                    pos_display.append(pos_computation_for_display1_DL)
+                    pos_display.append(width_for_accuracy_calculation)
+                    pos_display.append(height_for_accuracy_calculation)
+                    pos_display_resized = [2*i for i in pos_display]
+                    final_locations = np.vstack((final_locations, pos_display_resized))
+                    file_output = open("results_CACF_resnet/"+ self.dataset+"_CACF_DL.txt", "a")
+                    file_output.write("\n" + str(pos_display_resized[0]) + "," + str(pos_display_resized[1])+"," + str(pos_display_resized[2])+"," + str(pos_display_resized[3]))
+                    file_output.close()
+                else:
+                    pos_computation_for_display0 = np.floor(np.subtract(pos[1],np.divide(width_for_accuracy_calculation,2)))
+                    pos_computation_for_display1 = np.floor(np.subtract(pos[0],np.divide(height_for_accuracy_calculation,2)))
+                    if pos_computation_for_display0 < 0:
+                        pos_computation_for_display0 =0
+                    if pos_computation_for_display1 < 0:
+                        pos_computation_for_display1 =0
+                    pos_display.append(pos_computation_for_display0)
+                    pos_display.append(pos_computation_for_display1)
+                    pos_display.append(width_for_accuracy_calculation)
+                    pos_display.append(height_for_accuracy_calculation)
+                    pos_display_resized = pos_display
+                    final_locations = np.vstack((final_locations, pos_display))
+                    file_output = open("results_CACF_resnet/"+ self.dataset+"_CACF_DL.txt", "a")
+                    file_output.write("\n" + str(pos_display[0]) + "," + str(pos_display[1])+"," + str(pos_display[2])+"," + str(pos_display[3]))
+                    file_output.close()
+
+                
+                
+                # visualize the tracking process...
+                # represents the top left corner of rectangle 
+                start_point = (int(pos_display_resized[0]), int(pos_display_resized[1])) 
+                # Ending coordinate, here (220, 220) 
+                # represents the bottom right corner of rectangle 
+                endpoint0 = int(pos_display_resized[0]+pos_display_resized[2])
+                endpoint1 = int(pos_display_resized[1]+pos_display_resized[3])
+                end_point = (endpoint0, endpoint1) 
+                # Blue color in BGR 
+                color = (255, 0, 0) 
+                # Line thickness of 2 px 
+                thickness = 2
+                # Using cv2.rectangle() method 
+                # Draw a rectangle with blue line borders of thickness of 2 px 
+                cv2.rectangle(display_frame, start_point, end_point, color, thickness) 
+                #cv2.rectangle(current_frame, (pos_display[0], pos_display[1]), (pos_display[0]+pos_display[2], pos_display[1]+pos_display[3]), (255, 0, 0), 2)
+                cv2.imshow('demo', display_frame)
+                cv2.waitKey(100)
+                # if record... save the frames..
+                if self.args.record:
+                    frame_path = 'record_frames/' + self.img_path.split('/')[1] + '/'
+                    if not os.path.exists(frame_path):
+                        os.mkdir(frame_path)
+                    cv2.imwrite(frame_path + str(idx).zfill(5) + '.png', current_frame)
+                        #Delete all the evaluation folder
+        shutil.rmtree('train_folder') 
+        shutil.rmtree('test_folder')
+        #shutil.rmtree('evaluation_folder')        
+        return [final_locations,gt]  
+                          
+    
+    def iou_computation_CACFmethod(self, val):  
+        #Accuracy Computation
+        gt_row =[]
+        mosse_out =[]
+        acc_val =[]
+        overall_iou = []
+        iou_each_frame =[]
+        ground_values = val[1]
+        #mosseCACF_values = val[1]
+        mosseCACF_values = val[0]
+        for i in range(0, len(ground_values)): 
+            #print(len(ground_values))
+            gt_row = ground_values[i]
+            mosse_out = list(mosseCACF_values[i])
+            r1 =[]
+            r2 =[]
+            c1 = []
+            c2 =[]
+            ci = []
+            #r1 = [(gt_row[1]+np.divide(gt_row[3],2)), (gt_row[0]+np.divide(gt_row[2],2)), gt_row[2], gt_row[3] ]
+            r1 = [(gt_row[1]+np.divide(gt_row[3],2)), (gt_row[0]+np.divide(gt_row[2],2)), mosse_out[2], mosse_out[3] ]
+            r2 = [(mosse_out[1]+np.divide(mosse_out[3],2)), (mosse_out[0]+np.divide(mosse_out[2],2)), mosse_out[2], mosse_out[3] ]
+            c1 = [r1[0],r1[1],r1[2]+r1[0],r1[3]+r1[1]]
+            c2 = [r2[0],r2[1],r2[2]+r2[0],r2[3]+r2[1]]
+            #compute coordinates of maximum intersection
+            ci = [max(c1[0], c2[0]), max(c1[1],c2[1]), min(c1[2],c2[2]), min(c1[3],c2[3])]
+            wi = ci[2]-ci[0]
+            hi = ci[3]-ci[1]
+            ai = np.multiply(wi,hi)
+            au = (np.multiply(r1[2],r1[3]) + np.multiply(r2[2],r2[3])) - ai
+            iou_frame_wise = np.divide(ai,au)
+            iou_each_frame.append(np.abs(iou_frame_wise))             
+        overall_iou = np.mean(iou_each_frame)           
+        return overall_iou 
+
+    # pre train the filter on the first frame...
+    def _pre_training(self, init_frame, G):
+        height, width = G.shape
+        fi = cv2.resize(init_frame, (width, height))
+        # pre-process img..
+        fi = pre_process(fi)
+        Ai = G * np.conjugate(np.fft.fft2(fi))
+        Bi = np.fft.fft2(init_frame) * np.conjugate(np.fft.fft2(init_frame))
+        for _ in range(self.args.num_pretrain):
+            if self.args.rotate:
+                fi = pre_process(random_warp(init_frame))
+            else:
+                fi = pre_process(init_frame)
+            Ai = Ai + G * np.conjugate(np.fft.fft2(fi))
+            Bi = Bi + np.fft.fft2(fi) * np.conjugate(np.fft.fft2(fi))
+        
+        return Ai, Bi
+    
+        # get the ground-truth gaussian reponse...  
+    #lasithas gaussian response CACF
+    def _gauss_label(self,out_sigma,window_sz):
+        #eveluate a gaussian with the peak at the centre element
+        #col, row = np.meshgrid((np.arange(window_sz[1]))-np.floor(window_sz[1]/2), (np.arange(window_sz[0])--np.floor(window_sz[0]/2)))
+        col, row = np.meshgrid((np.arange(window_sz[1])), (np.arange(window_sz[0])))
+        updated_col = np.subtract(col,np.floor(window_sz[1]/2))
+        updated_row = np.subtract(row,np.floor(window_sz[0]/2))
+        intermediate_step1 = np.square(updated_row)
+        intermediate_step2 = np.square(updated_col)
+        intermediate_step3 = np.add(intermediate_step1, intermediate_step2)
+        intermediate_step4 = np.divide(-0.5, np.square(out_sigma))
+        intermediate_step5 = (intermediate_step4)* intermediate_step3
+        labels = np.exp(intermediate_step5)
+        # move the peak to the topleft with wrap around
+        val0 = int(np.floor((window_sz[0]/2)))
+        val1 = int(np.floor((window_sz[1]/2)))
+        x = np.roll(labels, -val0, axis=0) # up
+        x1 = np.roll(x, -val1, axis=1) # left
+        assert(x1[0][0] ==1)
+        return x1
+
+    # it will extract the image list 
+    def _get_img_lists(self, img_path):
+        frame_list = []
+        for frame in os.listdir(img_path):
+            if os.path.splitext(frame)[1] == '.jpg':
+                frame_list.append(os.path.join(img_path, frame)) 
+        return frame_list
+    
+    # it will get the first ground truth of the video..
+    def _get_init_ground_truth(self, img_path):
+        gt_path = os.path.join(img_path, 'groundtruth.txt')
+        with open(gt_path, 'r') as f:
+            # just read the first frame...
+            line = f.readline()
+            gt_pos = line.split(',')
+
+        return [float(element) for element in gt_pos]
+     
+    def _get_subwindow(self, init_frame, pos, window_sz):
+        if pos[0]<0:
+            pos[0]=0
+        if pos[1]<0:
+            pos[1]=0
+        patch_condition =1
+        init_frame = init_frame.astype(int)
+        height_of_image = init_frame.shape[0]
+        width_of_image = init_frame.shape[1]
+        xs = np.floor(pos[1]) + np.arange(0,window_sz[1],1) - np.floor(np.divide(window_sz[1],2))  
+        ys = np.floor(pos[0]) + np.arange(0,window_sz[0],1) - np.floor(np.divide(window_sz[0],2))
+        #Checkout for out of bound corordinates, and set them to the values at the borders
+        padding_left = 0
+        padding_left = [padding_left+1 for xs_val in xs if xs_val<0]
+        xs = [0 if xs_val<0 else xs_val for xs_val in xs]
+        padding_top = 0
+        if not any(xs):
+            #indicates no values, dont use this patch for any calculation
+            patch_condition = 0
+        padding_top= [padding_top +1 for ys_val in ys if ys_val<0]
+        ys = [0 if ys_val<0 else ys_val for ys_val in ys]
+        if not any(ys):
+            patch_condition = 0  
+        padding_right = 0
+        padding_right = [padding_right+1 for xs_val in xs if xs_val>width_of_image ]
+        xs = [(width_of_image) if xs_val>width_of_image else xs_val for xs_val in xs]
+        if not any(xs):
+            patch_condition = 0
+        if len(set(ys)) ==1:
+            patch_condition = 0
+        padding_bottom =0
+        padding_bottom = [padding_bottom+1 for ys_val in ys if ys_val>height_of_image ]   
+        ys = [(height_of_image) if ys_val>height_of_image else ys_val for ys_val in ys]
+        if not any(ys):
+            patch_condition = 0
+        if len(set(ys)) ==1:
+            patch_condition = 0
+        xs = [int(x) for x in xs]
+        ys = [int(y) for y in ys]
+        height_ = window_sz[0]
+        width_ = window_sz[1]
+        #top_left_location_y = np.floor(pos[0])-np.floor(np.divide(window_sz[0],2))
+        #top_left_location_x = np.floor(pos[1])-np.floor(np.divide(window_sz[1],2))
+        patch_starting_point_y = ys[0]
+        patch_starting_point_x = xs[0]
+        patch_end_point_y = ys[len(ys)-1]
+        patch_end_point_x = xs[len(xs)-1]
+        
+        patch = init_frame[patch_starting_point_y:patch_end_point_y, patch_starting_point_x:patch_end_point_x]            
+        patch = cv2.copyMakeBorder(patch,len(padding_top), len(padding_bottom), len(padding_left), len(padding_right), cv2.BORDER_REPLICATE)
+        if patch.shape[0] != window_sz[0]:
+            extra_padding_bottom = window_sz[0] - patch.shape[0]
+        else:
+            extra_padding_bottom = 0 
+        if patch.shape[1] !=window_sz[1]:
+            extra_padding_right = window_sz[1] - patch.shape[1]
+        else:
+            extra_padding_right =0
+            
+        patch = cv2.copyMakeBorder(patch,0, int(extra_padding_bottom), 0, int(extra_padding_right), cv2.BORDER_REPLICATE)    
+        return patch, patch_condition
+    
+    def _get_features(self, patch, cos_window):
+        x = np.double(patch)/255
+        x = x - np.mean(x)
+
+        if cos_window.any():
+            x = np.multiply(x,cos_window) 
+            return x
+    
+    def _resize_img(self, init_gt, init_frame_old):
+        if ((np.sqrt(np.multiply(init_gt[2],init_gt[3]))) >= 100):
+            #resize the image
+            pos = []
+            pos_intermediate = [np.add(np.divide(init_gt[3],2),init_gt[1]),np.add(np.divide(init_gt[2],2),init_gt[0])]
+            pos =[np.floor(np.divide(pos_intermediate[0],2)), np.floor(np.divide(pos_intermediate[1],2))]
+            init_gt_1 = np.abs(np.divide(init_gt[2],2))
+            init_gt_2 = np.abs(np.divide(init_gt[3],2))
+            target_sz = [np.floor(init_gt_2), np.floor(init_gt_1)]
+            resize_val1 = int(np.floor(np.divide(init_frame_old.shape[1],2)))
+            resize_val2 = int(np.floor(np.divide(init_frame_old.shape[0],2)))
+            resize_image_done =1
+            init_frame = cv2.resize(init_frame_old, dsize=(resize_val1, resize_val2), interpolation=cv2.INTER_CUBIC)    
+        else:
+            pos = []
+            pos = [np.add(np.divide(init_gt[3],2),init_gt[1]),np.add(np.divide(init_gt[2],2),init_gt[0])]
+            target_sz=[init_gt[3], init_gt[2]]
+            init_frame = init_frame_old
+            resize_image_done =0
+        return pos, target_sz, init_frame, resize_image_done
+
+    def _without_resize_img(self, init_gt, init_frame_old):
+        pos = []
+        target_sz = []
+        init_frame =init_frame_old
+        pos =[np.add(np.divide(init_gt[3],2), init_gt[1]), np.add(np.divide(init_gt[2],2),init_gt[0])]
+        target_sz=[init_gt[3], init_gt[2]]
+        init_frame = init_frame_old
+        return pos, target_sz, init_frame
+    
+    def _get_feature_for_all_offset(self, init_frame, pos, offset, window_sz, cos_window,xf,width_for_accuracy_calculation, height_for_accuracy_calculation):
+    #lasitha - computing stacked features for all offset locations
+        for val in range(len(offset)):
+            patch_info = self._get_subwindow(init_frame, np.add(pos,offset[val]), window_sz)
+            patch =patch_info[0]
+            xfn = np.fft.fft2(self._get_features(patch,cos_window))
+            out_feature = np.multiply(np.conj(xfn), xfn)
+            if val ==0:
+                temp = out_feature
+            elif val ==1:
+                temp1 = out_feature
+            elif val ==2:
+                temp2 = out_feature
+            else:
+                temp3 = out_feature
+                kfn = np.dstack((temp,temp1,temp2,temp3))
+    
+                return kfn
+
+    def _computation_input_frame_without_target(self, initalimg, initialgt, window_sz): 
+        images_training = initalimg
+        shape_x = images_training.shape[0]
+        shape_y = images_training.shape[1]
+        pos0 = int(np.floor(initialgt[1]))-30
+        pos1 = int(np.floor(initialgt[0]))-30
+        if pos0<0 :
+            pos0 = 0
+        if pos1<0 :
+            pos1 = 0
+        window_sz0 = int(np.floor(window_sz[0]))+30
+        window_sz1 = int(np.floor(window_sz[1]))+30
+        if window_sz0 > images_training.shape[0] :
+            window_sz0 = images_training.shape[0]
+        if window_sz1 > images_training.shape[1] :
+            window_sz1 = images_training.shape[1]
+        images_training[pos0:pos0+window_sz0,pos1:pos1+window_sz1] = np.zeros((window_sz0,window_sz1,3))
+        #imgplot = plt.imshow(images_training)
+        #plt.show() 
+        return images_training
+
+    def _non_max_suppression_slow(self, boxes, overlapThresh):
+	    if len(boxes) == 0:
+		    return []
+	    pick = []
+	    x1 = boxes[:,0]
+	    y1 = boxes[:,1]
+	    x2 = boxes[:,2]
+	    y2 = boxes[:,3]
+	    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+	    idxs = np.argsort(y2)
+	    while len(idxs) > 0:
+		    last = len(idxs) - 1
+		    i = idxs[last]
+		    pick.append(i)
+		    suppress = [last]
+		    for pos in range(0, last):
+			    j = idxs[pos]
+			    xx1 = max(x1[i], x1[j])
+			    yy1 = max(y1[i], y1[j])
+			    xx2 = min(x2[i], x2[j])
+			    yy2 = min(y2[i], y2[j])
+			    w = max(0, xx2 - xx1 + 1)
+			    h = max(0, yy2 - yy1 + 1)
+			    overlap = float(w * h) / area[j]
+			    if overlap > overlapThresh:
+				    suppress.append(pos)
+		    idxs = np.delete(idxs, suppress)
+	    return boxes[pick]   
+    
+    def _compute_best_patch(self, selected_patch, previous_position):
+        previous_xywh = []
+        previous_xywh.append(previous_position[0])
+        previous_xywh.append(previous_position[1])
+        all_ious = []
+        identified_patch = []
+        selected_patch_after_iou =[]
+        for selected_patches in selected_patch:    
+            selected_patches_width = selected_patches[0][2]- selected_patches[0][0]
+            selected_patches_height = selected_patches[0][3]- selected_patches[0][1]
+            input_xywh = []
+            previous_xywh.append(selected_patches_width)
+            previous_xywh.append(selected_patches_height)
+            input_xywh.append(selected_patches[0][0])
+            input_xywh.append(selected_patches[0][1])
+            input_xywh.append(selected_patches_width)
+            input_xywh.append(selected_patches_height)
+            xA1 = max(previous_xywh[0], input_xywh[0])
+            yA1 = max(previous_xywh[1], input_xywh[1])
+            xB1 = min(previous_xywh[2], input_xywh[2])
+            yB1 = min(previous_xywh[3], input_xywh[3])
+            interArea = max(0, xB1 - xA1 + 1) * max(0, yB1 - yA1 + 1)
+            boxAArea = previous_xywh[2]*previous_xywh[3]
+            boxBArea = input_xywh[2]*input_xywh[3]
+            iou = interArea / float(boxAArea + boxBArea - interArea)
+            all_ious.append(iou)
+        max_value = max(all_ious)
+        loc_max_valuee = max_value.index(max(max_value))
+        identified_patch = selected_patches[loc_max_valuee]
+        selected_patch_after_iou.append(identified_patch[1])
+        selected_patch_after_iou.append(identified_patch[0])
+        return selected_patch_after_iou
+
+    def _remove_false_positive(self, previous_position,centre_location_frame, window_sz):
+        xA1 = max(previous_position[0], centre_location_frame[0])
+        yA1 = max(previous_position[1], centre_location_frame[1])
+        xB1 = min(np.add(previous_position[0],window_sz[1]), np.add(centre_location_frame[0],window_sz[1]))
+        yB1 = min(np.add(previous_position[1],window_sz[0]), np.add(centre_location_frame[1],window_sz[0]))
+        interArea = max(0, xB1 - xA1 + 1) * max(0, yB1 - yA1 + 1)
+        boxAArea = window_sz[0]*window_sz[1]
+        boxBArea = window_sz[0]*window_sz[1]
+        iou = interArea / float(boxAArea + boxBArea - interArea)
+        if iou > 0.3:
+            false_pos =0
+        else:
+            false_pos =1
+        return false_pos
+
+    def _remove_false_positive_best(self, previous_position,bbboxes, window_sz):
+        iou_result =[]
+        for bbbox in bbboxes:
+            xA1 = max(previous_position[0], bbbox[0])
+            yA1 = max(previous_position[1], bbbox[1])
+            xB1 = min(np.add(previous_position[0],window_sz[1]), np.add(bbbox[0],window_sz[1]))
+            yB1 = min(np.add(previous_position[1],window_sz[0]), np.add(bbbox[1],window_sz[0]))
+            interArea = max(0, xB1 - xA1 + 1) * max(0, yB1 - yA1 + 1)
+            boxAArea = window_sz[0]*window_sz[1]
+            boxBArea = window_sz[0]*window_sz[1]
+            iou = interArea / float(boxAArea + boxBArea - interArea)
+            iou_result.append(iou)
+        position_maximum = [i for i, j in enumerate(iou_result) if j == max(iou_result)]
+        return position_maximum
